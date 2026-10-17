@@ -1,4 +1,4 @@
-# WatchHandMod v1.0 — 四人实时手牌
+# AstralParty-WatchHandMod
 
 给《Astral Party / 吉星派对》（Steam 国服）用的模组：**实时显示四名玩家的手牌**。
 

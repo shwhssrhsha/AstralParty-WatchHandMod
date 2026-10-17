@@ -1,4 +1,4 @@
-# 变更日志
+# AstralParty-WatchHandMod — 变更日志
 
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
