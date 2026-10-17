@@ -1,0 +1,4 @@
+# astral-watch-service 运行依赖
+# 安装: pip install -r requirements.txt
+protobuf>=4.25
+certifi

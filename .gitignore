@@ -1,0 +1,44 @@
+# ── 编译产物 ──
+bin/
+obj/
+*.pdb
+!*.deps.json
+
+# ── Python 缓存 ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ── 依赖安装产物 ──
+.pylibs/
+packages/
+
+# ── IDE / 编辑器的本地文件 ──
+.vs/
+.vscode/
+.idea/
+*.user
+*.suo
+*.swp
+
+# ── ★ 含个人凭据的本地文件（绝对不能提交）──
+watch_service.json
+.astral_watch_sid.json
+service.log
+*.log
+start.cmd
+*.cmd
+*.bak
+*.pre-v1.0
+*.damaged-bak
+NuGet.Config
+
+# ── 压缩包与临时文件 ──
+*.zip
+*.tmp
+*.temp
+Thumbs.db
+desktop.ini
+.DS_Store
