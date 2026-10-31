@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Reflection;
 using CesiumLoader.SDK.Gameplay;
 using CesiumLoader.SDK.Inputs;
 using CesiumLoader.SDK.Logging;
@@ -62,11 +63,59 @@ namespace WatchHandMod
         private static GComponent _hud;
         /// <summary>v34: HUD 面板缓存 —— 之前每帧递归遍历整棵 UI 树(FindPanel), 实测把帧率压到 ~2 FPS。</summary>
         private static UIBattleInfoPanel _panelCache;
-        /// <summary>v37: OnFrame frame counter (throttles the tooltip raise-to-top).</summary>
-        private static int _frameTicks;
+        /// <summary>v64: tooltip 置顶已移到 OnTick, 不再需要每帧计数。</summary>
         /// <summary>v39: Q 键开关 —— 默认关(零渲染开销), 开启后才画队友手牌。</summary>
         private static bool _handsVisible;
         private static bool _keyQHeld;
+        /// <summary>v65: 0=未知 1=原生 Input.GetKeyDown 2=反射 fallback。只用于日志判别。</summary>
+        private static int _keyPath;
+        /// <summary>v66: 屏幕开关按钮(取代 Q 键, 走 FairyGUI onClick, 零轮询)。</summary>
+        private static GComponent _toggle;
+        private static GTextField _toggleText;
+        private const float ToggleW = 62f;
+        private const float ToggleH = 24f;
+
+        // ===== v68 诊断开关: 屏幕上逐项开关, 用一次实机测试定位是哪一项导致"跳" =====
+        private static bool _swHook = true;     // HookSyncProbes(替换游戏 RPC 回调)
+        private static bool _swWrite = true;    // WriteWatchTarget(读房间状态)
+        private static bool _swPoll = true;     // HTTP 轮询 + 收结果
+        private static bool _swRender = true;   // Update(手牌渲染/挂载)
+        private static bool _swDiag = true;     // DumpSources/DumpServiceDiag/prof/指纹采样
+        /// <summary>v69: 后台请求 —— 手牌不显示时也发请求, 但一张卡都不画。
+        /// 目的是把"发请求"和"渲染手牌"这两个原本绑死的变量拆开:
+        /// 冷启动 + 只开 B(手牌不点) 若仍跳 => 元凶是请求; 若不跳 => 元凶是渲染。</summary>
+        private static bool _swBgReq;
+        private static readonly string[] SwNames =
+            { "H hook", "W 写码", "P 轮询", "R 渲染", "D 诊断", "B 后台请求" };
+        private static GComponent _swBox;
+        private static readonly GTextField[] _swTexts = new GTextField[6];
+
+        private static bool SwGet(int i)
+        {
+            switch (i)
+            {
+                case 0: return _swHook;
+                case 1: return _swWrite;
+                case 2: return _swPoll;
+                case 3: return _swRender;
+                case 4: return _swDiag;
+                default: return _swBgReq;
+            }
+        }
+
+        private static void SwToggle(int i)
+        {
+            switch (i)
+            {
+                case 0: _swHook = !_swHook; break;
+                case 1: _swWrite = !_swWrite; break;
+                case 2: _swPoll = !_swPoll; break;
+                case 3: _swRender = !_swRender; break;
+                case 4: _swDiag = !_swDiag; break;
+                default: _swBgReq = !_swBgReq; break;
+            }
+            SdkLog.Info("WatchHand", "诊断开关 " + SwNames[i] + " -> " + (SwGet(i) ? "开" : "关"));
+        }
         private static GComponent _tip;
         private static GGraph _tipBg;
         private static GRichTextField _tipText;
@@ -77,6 +126,16 @@ namespace WatchHandMod
         private static bool _chainLogged;
         /// <summary>已打印过 render 诊断的卡牌 ID(每张只打一次, 避免刷屏)。</summary>
         private static readonly HashSet<int> RenderLogged = new HashSet<int>();
+        /// <summary>
+        /// 诊断(v46, 2026-10-26): 统计 "strip 还在原容器里" 与 "需要重建" 的次数。
+        /// 目的是量化游戏是否在反复重置玩家按钮 —— 若 rebuilds 快速上涨而 hits 不动,
+        /// 说明游戏持续把我们 AddChild 进 Button 的子节点移除/销毁, 那就是"界面周期性重置"的机制。
+        /// </summary>
+        private static int _stripRebuilds;
+        /// <summary>诊断(v56): PollService 真正被调用(即将发请求)的累计次数。</summary>
+        private static int _pollCount;
+        private static int _stripHits;
+        private static int _stripRebuildLogs;
         /// <summary>
         /// v20: 服务器实时下发的手牌快照(按玩家)。
         /// 来源 = SDK 的 GameEvents.HandChanged(包装 RoomHeroCardChangeS2C 得到)。
@@ -89,6 +148,26 @@ namespace WatchHandMod
             new Dictionary<long, List<HandCardData>>();
         private static bool _hookedEvents;
         private static int _handEventCount;
+
+        // =====================================================================
+        // v59 探针(2026-10-27): **只记录, 不改游戏行为**。
+        //   目的: 验证"视角跳回自己 + 选目标被清空"是否由这条链引起:
+        //     OnlineSyncRoomIdS2C(1052) → RequestSyncRoomC2S → SyncRoomS2C
+        //     → roomController.Dispose() + CreateRoom() → 相机回自机 / selectPlayer 归 0
+        //   做法: 把游戏自己的 RPC 回调包一层(原回调一律转发), 记录到达时间;
+        //         并每 tick 采样 GRoot 子节点数 / UIBattleInfoPanel 实例变化。
+        //   **不改任何现有行为**, 只是旁路观测。
+        // =====================================================================
+        private static OnlineSyncRoomIdS2CRPC.OnOnlineSyncRoomIdS2CServerDelegate _probeOrigOnlineSync;
+        private static OnlineSyncRoomIdS2CRPC.OnOnlineSyncRoomIdS2CServerDelegate _probeMineOnlineSync;
+        private static SyncRoomS2CRPC.OnSyncRoomS2CServerDelegate _probeOrigSyncRoom;
+        private static SyncRoomS2CRPC.OnSyncRoomS2CServerDelegate _probeMineSyncRoom;
+        private static int _probeOnlineSyncCount;
+        private static int _probeSyncRoomCount;
+        private static int _probeHookLogs;
+        private static int _probeUiLogs;
+        private static int _probeLastNumChildren = -1;
+        private static UIBattleInfoPanel _probeLastPanel;
 
         /// <summary>
         /// v24: HeroAttrUpdated(UpdateHeroAttrS2C) 里手牌字段的原始记录。
@@ -525,11 +604,11 @@ namespace WatchHandMod
         }
 
         /// <summary>
-        /// v1.0: 取某玩家要显示的手牌 —— **观战服务优先**(它才是实时源)。
+        /// v44: 取某玩家要显示的手牌 —— **观战服务优先**(它才是实时源)。
         ///
-        /// 为什么不能用本地数据: rp.serverPlayer.Hero.Cards 与 rp.cardContainer._HandCards
-        /// 对四人都有数据、也无掩码, 但**是快照、不随出牌更新**(实测相隔 32 秒完全一致)。
-        /// 所以本地数据只在服务拿不到时兜底都不合适 —— 会显示"看起来像真的但是旧的"手牌。
+        /// 为什么不用本地数据: rp.serverPlayer.Hero.Cards 与 rp.cardContainer._HandCards
+        /// 对四人都有数据、也无掩码, 但**是快照、不随出牌更新** —— 实测相隔 32 秒完全一致,
+        /// 而同一时刻服务侧 count 从 5 变成 4。用本地数据会显示"看起来像真的、其实是旧的"手牌。
         /// 顺序: SvcHands(需 5 秒内更新过) → LiveHands → 失败(界面显示"手牌加载失败")。
         /// </summary>
         private static IReadOnlyList<HandCardData> CardsOf(RoomPlayer rp, CardContainer cc)
@@ -539,9 +618,8 @@ namespace WatchHandMod
                 return null;
             }
             // ① 观战服务(真·实时) —— 必须检查时效, 服务停了就不能继续摆旧数据
-            // v1.0: 时效用**帧计数**判断, 不用 Environment.TickCount ——
-            // 实测 TickCount 在本机 IL2CPP 下不增长(诊断里 age 永远同一个数),
-            // 导致"永远判定过期"; 而 _ticks 稳定增长(约 1.9 次/秒)。
+            // v44: 时效用**帧计数**判断 —— Environment.TickCount 在本机 IL2CPP 下不增长
+            // (诊断里 age 永远同一个数, 导致永远判定过期); _ticks 稳定增长(约 1.9/秒)。
             long svcAgeTicks = _ticks - _svcHandsAtTicks;
             bool svcFresh = _svcHandsAtTicks > 0 && svcAgeTicks <= SvcStaleTicks;
             if (svcFresh)
@@ -564,42 +642,6 @@ namespace WatchHandMod
             }
             // ③ 拿不到 → null, 由调用方显示"手牌加载失败"
             return null;
-        }
-
-        /// <summary>v45: 把 rp.serverPlayer.Hero.Cards 转成 HandCardData 列表(拿不到返回 null)。</summary>
-        private static List<HandCardData> LocalHeroCards(RoomPlayer rp)
-        {
-            try
-            {
-                Player sp = rp.serverPlayer;
-                Hero hero = sp == null ? null : sp.Hero;
-                if (hero == null)
-                {
-                    return null;
-                }
-                var hc = hero.Cards;
-                if (hc == null || hc.Count == 0)
-                {
-                    return null;
-                }
-                var outList = new List<HandCardData>(hc.Count);
-                for (int k = 0; k < hc.Count; k++)
-                {
-                    CardInfo ci = hc[k];
-                    int cid = ci == null ? 0 : ci.CardId;
-                    if (cid <= 0)
-                    {
-                        continue;
-                    }
-                    // HandCardData(Id, Guid, PurifyNum, IsTemp, battleCost=-1) → 费用自动取 cfg.Cost
-                    outList.Add(new HandCardData(cid, 0, 0, false, -1));
-                }
-                return outList.Count > 0 ? outList : null;
-            }
-            catch (Exception)
-            {
-                return null;
-            }
         }
 
         /// <summary>v43: 手牌取不到时, 在对应位置明确显示失败原因, 而不是摆一份陈旧的开局快照。</summary>
@@ -635,44 +677,40 @@ namespace WatchHandMod
         /// v1.0(发布版): 观战服务地址与令牌**不再硬编码**, 改由用户自己的配置文件提供:
         ///
         ///   AstralParty_ModLoader\mods\WatchHandMod\watch_service.json
-        ///   { "url": "http://&lt;你自己的服务器&gt;:8765", "token": "&lt;你自己设的 token&gt;" }
+        ///   { "url": "http://你自己的服务器:8765", "token": "你自己设的 token" }
         ///
         /// 文件不存在 = 不启用(界面显示"手牌加载失败: 服务未配置"), 不影响游戏本身。
         /// 这样分发的 dll 里不含任何服务端地址/令牌。
+        /// 注: 自用版(WatchHandMod)保持硬编码, 与发布版分开维护。
         /// </summary>
         private static string _svcUrl = "";
         private static string _svcToken = "";
         private static string _svcStatus = "未配置";
-        private static volatile string _svcLastError = "";   // v43: 最近一次服务侧失败原因(界面显示用)
-        /// <summary>v1.0: 上次成功拿到服务数据时的**帧计数**(_ticks)。见 SvcStaleTicks 的说明。</summary>
-        private static long _svcHandsAtTicks;
-        /// <summary>
-        /// v1.0: 服务数据超过这么多**帧**(约 1.9 次/秒 → 10 帧≈5 秒)没更新就算失效。
-        /// 不用秒数: Environment.TickCount 在本机 IL2CPP 下不增长, 按它算会永远判定过期。
-        /// </summary>
-        private const int SvcStaleTicks = 10;
         /// <summary>v1.0: 配置检查节流(帧, ≈10 帧/5 秒)。</summary>
         private static long _svcCfgCheckedTick;
-        /// <summary>v44: 服务数据超过这个秒数没更新就算失效 —— 否则会一直显示"最后一次成功的旧手牌"。</summary>
-        private const int SvcStaleSec = 5;
-        /// <summary>v1.0: 单次请求硬超时(毫秒)。超过就强制认为失败, 避免 _svcBusy 永久卡死。</summary>
+        private static volatile string _svcLastError = "";   // v43: 最近一次服务侧失败原因(界面显示用)
+        /// <summary>v44: 上次成功拿到服务数据时的帧计数(_ticks)。</summary>
+        private static long _svcHandsAtTicks;
+        /// <summary>v44: 超过这么多帧(≈10 帧 = 5 秒)没更新就算失效 —— 否则会一直显示旧手牌。</summary>
+        private const int SvcStaleTicks = 10;
+        /// <summary>v44: 单次请求硬超时(帧)。超过就强制认为失败, 避免 _svcBusy 永久卡死。</summary>
         private const int PollHardTimeoutTicks = 19;   // ≈10 秒(帧≈1.9/秒)
         private static long _svcPollStarted;
-        /// <summary>v1.0: 配置文件检查节流(秒)。</summary>
         private static long _svcLastPoll;
         private static volatile string _svcJsonResult;
         private static volatile bool _svcBusy;
+        /// <summary>v61: 在途的 UnityWebRequest(反射对象); 非 null 表示正在下载。</summary>
+        private static object _svcReq;
         private static readonly Dictionary<long, List<HandCardData>> SvcHands =
             new Dictionary<long, List<HandCardData>>();
         private static readonly object SvcHandsLock = new object();
 
         /// <summary>
         /// v1.0(发布版): 从用户自己的 watch_service.json 读服务地址与令牌。
-        /// 每 5 秒看一次(支持运行中改配置)。文件不存在 = 不启用。
+        /// 每 5 秒(10 帧)看一次, 支持运行中改配置。文件不存在 = 不启用。
         /// </summary>
         private static void RefreshServiceConfig()
         {
-            // v1.0: 节流用帧计数(≈10 帧/5 秒), 不用 TickCount
             long cfgNowTick = _ticks;
             if (cfgNowTick - _svcCfgCheckedTick < 10)
             {
@@ -726,7 +764,7 @@ namespace WatchHandMod
         }
 
         /// <summary>
-        /// v1.0: 找 watch_service.json —— 优先 mod 自己的文件夹, 其次加载器根目录。
+        /// v1.0: 找 watch_service.json —— 优先 mod 自己的文件夹, 其次 mods 根, 再其次加载器根。
         /// 加载器会把 mods 目录通过环境变量 CESIUM_MODS_DIR 交给 mod。
         /// </summary>
         private static string FindServiceConfigPath()
@@ -767,57 +805,33 @@ namespace WatchHandMod
         }
 
         /// <summary>
-        /// 发一次查询 —— 走后台线程 + WebClient（同步下载在子线程里做, 不阻塞游戏主线程）。
-        /// 不用 UnityWebRequest: 它在 netstandard2.0 下强制依赖框架版 System.Uri, 编译不过。
+        /// v61: 发一次查询 —— 反射调用 Unity 的 UnityWebRequest（主线程发起 + 主线程轮询 isDone）。
+        /// 为什么不再用线程池 / System.Net.Sockets / HttpWebRequest:
+        ///   实测只要走过 .NET 线程池或 System.Net, 之后即使完全不再发包,
+        ///   游戏界面仍会持续周期性重建(v56 HttpWebRequest、v58 原始 Socket 都这样),
+        ///   而官方 HandViewerMod 全程用 UnityWebRequest, 没有这个现象。
+        ///   反射调用可避开对 UnityWebRequestModule 的编译期依赖
+        ///   (netstandard2.0 下直接引用会强制要求框架版 System.Uri, 编不过)。
         /// </summary>
-        /// <summary>
-        /// v1.0: 到期无条件中断请求 —— HttpWebRequest.Timeout 在 IL2CPP 下实测不生效,
-        /// 只能靠 Abort() 强制打断阻塞中的调用。看门狗线程设为后台线程, 不阻止进程退出。
-        /// </summary>
-        private static void StartAbortWatchdog(System.Net.HttpWebRequest req, int ms)
-        {
-            try
-            {
-                var t = new System.Threading.Thread(delegate()
-                {
-                    try
-                    {
-                        System.Threading.Thread.Sleep(ms);
-                        req.Abort();
-                    }
-                    catch (Exception)
-                    {
-                    }
-                });
-                t.IsBackground = true;
-                t.Start();
-            }
-            catch (Exception)
-            {
-            }
-        }
-
         private static void PollService(string code)
         {
-            // v1.0: 全部用帧计数当"时钟"(TickCount 在本机不增长)。帧≈1.9/秒。
-            long now = _ticks;
-            // v1.0: 请求线程卡死的兜底 —— HttpWebRequest 的 Timeout 在 IL2CPP 下实测可能不生效,
-            // 线程挂死在读响应里, _svcBusy 永远为 true, 之后再也不发新请求
-            // (症状: status 长期停在"请求中...", 而 SvcHands 里还是旧数据, 超过 5 秒后
-            //  界面全变成"手牌加载失败: 服务已停止更新(Ns)")。
-            // 这里: 超过 PollHardTimeoutMs 还没回来就强制放行, 允许下一次请求。
-            if (_svcBusy)
+            long now = _ticks;   // v44: 用帧计数当"时钟"(TickCount 在本机不增长)
+
+            // ---- 1) 先在途请求: 完成就收, 超时就丢 ----
+            if (_svcReq != null)
             {
-                if (_svcPollStarted > 0 && (now - _svcPollStarted) > PollHardTimeoutTicks)
+                bool done;
+                try { done = (bool)SvProp(_svcReq, "isDone"); }
+                catch (Exception) { done = true; }
+                bool timeout = (now - _svcPollStarted) > PollHardTimeoutTicks;
+                if (!done && !timeout)
                 {
-                    _svcBusy = false;
-                    _svcStatus = "上次请求超时已重置";
+                    return;                       // 还在下载, 本 tick 什么都不做
                 }
-                else
-                {
-                    return;
-                }
+                FinishServiceRequest(done);
             }
+
+            // ---- 2) 再决定要不要发新的 ----
             if (string.IsNullOrEmpty(_svcUrl) || string.IsNullOrEmpty(code))
             {
                 return;
@@ -827,58 +841,143 @@ namespace WatchHandMod
                 return;
             }
             _svcLastPoll = now;
-            _svcBusy = true;
-            _svcPollStarted = now;
-            // 观战码/token 都是字母数字, 直接拼
-            string url = _svcUrl.TrimEnd('/') + "/hands?code=" + code
-                + (string.IsNullOrEmpty(_svcToken) ? "" : "&token=" + _svcToken);
-            _svcStatus = "请求中...";
+            _pollCount++;
+            SdkLog.Info("WatchHand", "poll #" + _pollCount + " handsVisible=" + _handsVisible
+                + " busy=0 code=" + code);
+            StartServiceRequest(code);
+        }
+
+        private static object SvProp(object o, string name)
+        {
+            return o.GetType().GetProperty(name).GetValue(o, null);
+        }
+
+        /// <summary>v61: 反射创建 UnityWebRequest 并发起。成功返回 true。</summary>
+        private static bool StartServiceRequest(string code)
+        {
             try
             {
-                System.Threading.ThreadPool.QueueUserWorkItem(delegate(object _)
+                Type t = CesiumLoader.SDK.Runtime.RuntimeAssemblyService.FindTypeBySimpleName("UnityWebRequest");
+                if (t == null)
                 {
-                    System.Net.HttpWebRequest req = null;
-                    try
+                    _svcStatus = "找不到 UnityWebRequest";
+                    _svcJsonResult = "!ERR!找不到 UnityWebRequest";
+                    return false;
+                }
+                // 观战码/token 都是字母数字, 直接拼
+                string url = _svcUrl.TrimEnd('/') + "/hands?code=" + code
+                    + (string.IsNullOrEmpty(_svcToken) ? "" : "&token=" + _svcToken);
+                MethodInfo get = t.GetMethod("Get", new Type[] { typeof(string) });
+                if (get == null)
+                {
+                    _svcStatus = "UnityWebRequest.Get 不存在";
+                    _svcJsonResult = "!ERR!UnityWebRequest.Get 不存在";
+                    return false;
+                }
+                object req = get.Invoke(null, new object[] { url });
+                if (req == null)
+                {
+                    _svcStatus = "请求对象为空";
+                    _svcJsonResult = "!ERR!请求对象为空";
+                    return false;
+                }
+                try
+                {
+                    t.GetMethod("SetRequestHeader", new Type[] { typeof(string), typeof(string) })
+                        .Invoke(req, new object[] { "User-Agent", "WatchHandMod" });
+                }
+                catch (Exception) { }
+                try
+                {
+                    PropertyInfo tp = t.GetProperty("timeout");
+                    if (tp != null)
                     {
-                        // v33: 改用 HttpWebRequest —— WebClient 没有超时, 卡住就永久卡住
-                        // (实测: status 长期停在"配置已加载", 说明线程进去后再没出来)
-                        req = (System.Net.HttpWebRequest)System.Net.WebRequest.Create(url);
-                        try { req.Proxy = null; } catch (Exception) { }   // 绕过 clash 代理
-                        req.Timeout = 6000;
-                        req.ReadWriteTimeout = 6000;
-                        req.UserAgent = "WatchHandMod";
-                        // v1.0: 关键修复 —— 实测 req.Timeout 在 IL2CPP 下**不生效**
-                        // (日志证据: age=6s busy=1 err=- 一直不恢复, 6 秒超时从未触发)。
-                        // 所以另起一个"看门狗"线程, 到点无条件 Abort(), 它会强制中断阻塞中的
-                        // GetResponse()/ReadToEnd() 并抛异常, 保证 finally 一定被走到、_svcBusy 复位。
-                        StartAbortWatchdog(req, 8000);
-                        using (var resp = (System.Net.HttpWebResponse)req.GetResponse())
-                        using (var sr = new System.IO.StreamReader(resp.GetResponseStream(),
-                                                                   System.Text.Encoding.UTF8))
-                        {
-                            _svcJsonResult = sr.ReadToEnd();
-                        }
+                        tp.SetValue(req, 6, null);
                     }
-                    catch (Exception ex)
-                    {
-                        _svcJsonResult = "!ERR!" + ex.GetType().Name + ": " + ex.Message;
-                    }
-                    finally
-                    {
-                        if (req != null)
-                        {
-                            try { req.Abort(); } catch (Exception) { }
-                        }
-                        _svcBusy = false;
-                    }
-                });
+                }
+                catch (Exception) { }
+                MethodInfo send = t.GetMethod("SendWebRequest", Type.EmptyTypes);
+                if (send == null)
+                {
+                    _svcStatus = "SendWebRequest 不存在";
+                    _svcJsonResult = "!ERR!SendWebRequest 不存在";
+                    try { req.GetType().GetMethod("Dispose", Type.EmptyTypes).Invoke(req, null); } catch (Exception) { }
+                    return false;
+                }
+                send.Invoke(req, null);
+                _svcReq = req;
+                _svcPollStarted = _ticks;
+                _svcBusy = true;
+                _svcStatus = "请求中...";
+                return true;
             }
             catch (Exception ex)
             {
-                _svcBusy = false;
-                _svcStatus = "线程异常 " + ex.GetType().Name;
+                _svcStatus = "发起失败 " + ex.GetType().Name;
+                _svcJsonResult = "!ERR!发起失败 " + ex.GetType().Name + ": " + ex.Message;
+                return false;
             }
         }
+
+        /// <summary>v61: 收掉在途请求, 结果写进 _svcJsonResult 交给 PumpService。</summary>
+        private static void FinishServiceRequest(bool completed)
+        {
+            object req = _svcReq;
+            _svcReq = null;
+            _svcBusy = false;
+            if (req == null)
+            {
+                return;
+            }
+            try
+            {
+                if (!completed)
+                {
+                    _svcJsonResult = "!ERR!请求超时";
+                    return;
+                }
+                long code = 0;
+                try { code = Convert.ToInt64(SvProp(req, "responseCode")); } catch (Exception) { }
+                if (code != 200)
+                {
+                    _svcJsonResult = "!ERR!HTTP " + code;
+                    return;
+                }
+                ulong bytes = 0;
+                try { bytes = Convert.ToUInt64(SvProp(req, "downloadedBytes")); } catch (Exception) { }
+                if (bytes > 1048576)
+                {
+                    _svcJsonResult = "!ERR!响应过大";
+                    return;
+                }
+                object dh = SvProp(req, "downloadHandler");
+                string text = dh == null ? null : (string)dh.GetType().GetProperty("text").GetValue(dh, null);
+                _svcJsonResult = string.IsNullOrEmpty(text) ? "!ERR!空响应" : text;
+            }
+            catch (Exception ex)
+            {
+                _svcJsonResult = "!ERR!" + ex.GetType().Name + ": " + ex.Message;
+            }
+            finally
+            {
+                // ★ v74: 先 Abort 再 Dispose。官方 UnityHandRequest.Dispose() 就是这么做的。
+                //   只调 Dispose 不会中止底层仍在传输的请求, 于是"手牌关了、对象销毁了,
+                //   但那个 UnityWebRequest 还在跑"——表现就是关掉之后照样跳。
+                try
+                {
+                    MethodInfo abort = req.GetType().GetMethod("Abort", Type.EmptyTypes);
+                    if (abort != null)
+                    {
+                        abort.Invoke(req, null);
+                    }
+                }
+                catch (Exception)
+                {
+                }
+                try { req.GetType().GetMethod("Dispose", Type.EmptyTypes).Invoke(req, null); } catch (Exception) { }
+            }
+        }
+
 
         /// <summary>在主线程收结果并解析(OnFrame 调用)。</summary>
         private static void PumpService()
@@ -999,7 +1098,7 @@ namespace WatchHandMod
             }
             _svcStatus = "ok(" + tmp.Count + " 人)";
             _svcLastError = "";      // v43: 这次拿到数据了, 清掉上一次的失败原因
-            _svcHandsAtTicks = _ticks;   // v1.0: 记录时效起点(帧计数)
+            _svcHandsAtTicks = _ticks;   // v44: 记录时效起点(帧计数)
         }
 
         private static double Num(object v)
@@ -1051,12 +1150,17 @@ namespace WatchHandMod
                 long roomId = 0L;
                 try
                 {
-                    if (room.info != null)
-                    {
-                        code = room.info.WatchCode ?? "";
-                        mapType = room.MapType;
-                        roomId = room.Id;
-                    }
+                    // ★ 2026-10-26 修复: 原来读的是 room.info.WatchCode —— 访问 room.info
+                    //   这个懒加载 getter 会让游戏重新拉取/重建房间信息, 表现为
+                    //   "界面每 15 秒整体刷新回默认状态"(已实测: 注释掉本函数调用后消失)。
+                    //   改用 RoomInfo 自己的缓存字段 watchCode(第 264 / 965 行一直用它, 无副作用)。
+                    code = room.watchCode ?? "";
+                    // v60: 原来读 room.MapType —— 它是会写游戏状态的 getter
+                    //   (RoomInfo.MapType: if (info.MapType == 0) info.MapType = 1;)。
+                    //   本函数挂在 _ticks % 30(≈15.5 秒), 与 _handsVisible 无关, 所以
+                    //   "关掉手牌窗口后界面仍每十几秒刷一次"就是它。改读 Room 的普通字段。
+                    mapType = room.info != null ? room.info.MapType : -1;
+                    roomId = room.Id;
                 }
                 catch (Exception ex)
                 {
@@ -1124,8 +1228,8 @@ namespace WatchHandMod
                     + " | url=" + (string.IsNullOrEmpty(_svcUrl) ? "<未配置>" : _svcUrl)
                     + " lastCode=" + (string.IsNullOrEmpty(_lastWatchCode) ? "<空>" : _lastWatchCode)
                     + " status=" + _svcStatus + " hands=" + hands
-                    // v1.0 诊断: status 每 2 秒会被 PollService 重置成"请求中...", 不能反映真实结果。
-                    // 这两个才是判据: 数据多久没更新过 / 最近一次失败原因。
+                    // v44 诊断: status 每 2 秒会被 PollService 重置成"请求中...", 不能反映真实结果。
+                    // 这两个才是判据: 数据多少帧没更新过 / 最近一次失败原因。
                     + " age=" + (_svcHandsAtTicks > 0
                         ? (_ticks - _svcHandsAtTicks).ToString() + "t" : "never")
                     + " busy=" + (_svcBusy ? "1" : "0")
@@ -1229,60 +1333,271 @@ namespace WatchHandMod
             }
         }
 
+        // =====================================================================
+        // v59 探针实现(2026-10-27): 旁路观测, 不改游戏行为
+        // =====================================================================
+
+        /// <summary>
+        /// 把 OnlineSyncRoomIdS2C / SyncRoomS2C 的游戏回调包一层, 原回调一律原样转发。
+        /// 游戏每场战斗会重置 RPC 回调, 所以每秒重挂一次(幂等: 已是自己的就不重复挂)。
+        /// </summary>
+        private static void HookSyncProbes()
+        {
+            try
+            {
+                NetManager net = MonoSingletonProvider<NetManager>.inst;
+                if (net == null || net.RPC == null)
+                {
+                    return;
+                }
+                OnlineSyncRoomIdS2CRPC a = net.RPC.OnlineSyncRoomIdS2C;
+                if (a != null && a.OnOnlineSyncRoomIdS2CServerCallBackAsync != _probeMineOnlineSync)
+                {
+                    _probeOrigOnlineSync = a.OnOnlineSyncRoomIdS2CServerCallBackAsync;
+                    _probeMineOnlineSync = ProbeOnlineSync;
+                    a.OnOnlineSyncRoomIdS2CServerCallBackAsync = _probeMineOnlineSync;
+                    if (_probeHookLogs < 8)
+                    {
+                        _probeHookLogs++;
+                        SdkLog.Info("WatchHand", "[probe] 已挂 OnlineSyncRoomIdS2C, 原回调="
+                            + (_probeOrigOnlineSync == null ? "<null>" : "有"));
+                    }
+                }
+                SyncRoomS2CRPC b = net.RPC.SyncRoomS2C;
+                if (b != null && b.OnSyncRoomS2CServerCallBackAsync != _probeMineSyncRoom)
+                {
+                    _probeOrigSyncRoom = b.OnSyncRoomS2CServerCallBackAsync;
+                    _probeMineSyncRoom = ProbeSyncRoom;
+                    b.OnSyncRoomS2CServerCallBackAsync = _probeMineSyncRoom;
+                    if (_probeHookLogs < 8)
+                    {
+                        _probeHookLogs++;
+                        SdkLog.Info("WatchHand", "[probe] 已挂 SyncRoomS2C, 原回调="
+                            + (_probeOrigSyncRoom == null ? "<null>" : "有"));
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                LogOnce("probeHook: " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        private static UniTask ProbeOnlineSync(OnlineSyncRoomIdS2C model, int errId, bool isDispatch)
+        {
+            try
+            {
+                _probeOnlineSyncCount++;
+                SdkLog.Info("WatchHand", "★★[probe] OnlineSyncRoomIdS2C #" + _probeOnlineSyncCount
+                    + " tick=" + _ticks
+                    + " roomId=" + (model == null ? 0L : model.RoomId)
+                    + " err=" + errId);
+            }
+            catch (Exception)
+            {
+            }
+            OnlineSyncRoomIdS2CRPC.OnOnlineSyncRoomIdS2CServerDelegate orig = _probeOrigOnlineSync;
+            if (orig == null)
+            {
+                return UniTask.CompletedTask;
+            }
+            try
+            {
+                return orig(model, errId, isDispatch);
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    SdkLog.Warn("WatchHand", "[probe] 原 OnlineSync 回调抛出: "
+                        + ex.GetType().Name + ": " + ex.Message);
+                }
+                catch (Exception)
+                {
+                }
+                return UniTask.CompletedTask;
+            }
+        }
+
+        private static UniTask ProbeSyncRoom(SyncRoomS2C model, int errId, bool isDispatch)
+        {
+            try
+            {
+                _probeSyncRoomCount++;
+                SdkLog.Info("WatchHand", "★★[probe] SyncRoomS2C #" + _probeSyncRoomCount
+                    + " tick=" + _ticks
+                    + " roomId=" + (model == null || model.Room == null ? 0L : model.Room.Id)
+                    + " err=" + errId);
+            }
+            catch (Exception)
+            {
+            }
+            SyncRoomS2CRPC.OnSyncRoomS2CServerDelegate orig = _probeOrigSyncRoom;
+            if (orig == null)
+            {
+                return UniTask.CompletedTask;
+            }
+            try
+            {
+                return orig(model, errId, isDispatch);
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    SdkLog.Warn("WatchHand", "[probe] 原 SyncRoom 回调抛出: "
+                        + ex.GetType().Name + ": " + ex.Message);
+                }
+                catch (Exception)
+                {
+                }
+                return UniTask.CompletedTask;
+            }
+        }
+
+        /// <summary>每 tick 采样: GRoot 子节点数变化 + UIBattleInfoPanel 实例变化(有上限, 防刷屏)。</summary>
+        private static void SampleProbeFingerprint()
+        {
+            try
+            {
+                GComponent root = GRoot.inst;
+                if (root != null)
+                {
+                    int nc = root.numChildren;
+                    if (nc != _probeLastNumChildren)
+                    {
+                        if (_probeUiLogs < 120)
+                        {
+                            _probeUiLogs++;
+                            SdkLog.Info("WatchHand", "[probe] GRoot.numChildren " + _probeLastNumChildren
+                                + " -> " + nc + " tick=" + _ticks
+                                + " syncRoom=" + _probeSyncRoomCount
+                                + " onlineSync=" + _probeOnlineSyncCount);
+                        }
+                        _probeLastNumChildren = nc;
+                    }
+                }
+                UIBattleInfoPanel p = _panelCache;
+                if (!object.ReferenceEquals(p, _probeLastPanel))
+                {
+                    if (_probeUiLogs < 120)
+                    {
+                        _probeUiLogs++;
+                        SdkLog.Info("WatchHand", "[probe] UIBattleInfoPanel 实例变化 -> "
+                            + (p == null ? "<null>" : "新实例") + " tick=" + _ticks);
+                    }
+                    _probeLastPanel = p;
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
         public static void Main()
         {
+            // v68: 恢复 tick 注册。v67 空壳实验作废 —— 源码当时被改成空壳, v68 加开关时
+            // 忘了改回来, 导致 v68 编出来也是空壳(游戏里没按钮、什么也不做)。现修正。
             ModBase.Run(OnInit, OnTick, tag: "WatchHand");
         }
 
         private static void OnInit()
         {
-            SdkLog.Info("WatchHand", "=== WatchHand v1.0 (release, user config) ===");
+            SdkLog.Info("WatchHand", "=== WatchHand v1.1 (发布版: json 配置; Q 键开关; 手牌可见时 2.1 秒轮询) ===");
             SdkLog.Info("WatchHand", "探针说明: F9=用当前观战码请求整房快照(含四人手牌); F10=直接发刷新请求");
-            // v20: 订阅 SDK 的手牌变化事件(包装 RoomHeroCardChangeS2C), 用于刷新队友手牌。
+            // ★ 2026-10-26 诊断实验 #1: 不订阅 GameEvents, 并置 _hookedEvents = false
+            //    → OnTick 里的 GameEvents.EnsureHooked() 也不会再被调用。
+            //    目的: 完全切断本 mod 与游戏 RPC 回调(RoomHeroCardChangeS2C / UpdateHeroAttrS2C)
+            //    的接触, 验证"界面周期性重置 / 点 A 落到 B"是否由 SDK 包装游戏回调引起。
+            //    影响: LiveHands 不再填充, handEvent / attrEvent 日志消失;
+            //          手牌主源 SvcHands(服务端快照轮询)不受影响, 服务端正常时显示不变。
             try
             {
-                GameEvents.HandChanged += OnHandChanged;
-                GameEvents.HeroAttrUpdated += OnHeroAttrUpdated;   // v24: 掩码定案用
-                _hookedEvents = true;
-                SdkLog.Info("WatchHand", "已订阅 GameEvents.HandChanged + HeroAttrUpdated");
+                // GameEvents.HandChanged += OnHandChanged;
+                // GameEvents.HeroAttrUpdated += OnHeroAttrUpdated;
+                _hookedEvents = false;
+                SdkLog.Info("WatchHand", "诊断实验#1: 跳过 GameEvents 订阅, EnsureHooked 将不再调用");
             }
             catch (Exception exh)
             {
                 SdkLog.Warn("WatchHand", "订阅 HandChanged 失败: " + exh.GetType().Name + ": " + exh.Message);
             }
-            // 每帧把提示框顶到最上层。只在 mod tick(=2.7 秒级) 里置顶是不够的:
-            // 游戏自己也在调整 UI 层级, 中间那几十帧会把提示框挤下去。
+            // ★ 2026-10-27 v79: 恢复每帧回调注册 —— 这是 Q 键能不能用的关键。
+            //   历史: v70 注释掉这行、把开关改成屏幕按钮; v71 按用户要求"恢复 Q 键"
+            //   时只恢复了 OnFrame 里面的读键代码, 却漏了这里的注册。结果 v71~v78
+            //   的 Q 键代码一直存在, 但 OnFrame 从未被调用(实测日志里一条
+            //   "Q 键路径 = ..." / "KeyQ: ..." 都没有), Q 键完全不通。
+            //   v78 又把屏幕按钮全部删掉, 于是"没有任何开关入口"。
+            //   现在把注册补回来: OnFrame 每帧只做一件事 —— 读一次 Q 键的边沿,
+            //   原生 Input.GetKeyDown 无分配, 开销可忽略。
             try
             {
                 Timers.inst.Add(0f, 0, OnFrame);
+                SdkLog.Info("WatchHand", "已注册每帧回调(OnFrame): Q 键开关生效");
             }
             catch (Exception ex)
             {
                 SdkLog.Warn("WatchHand", "Timers.Add failed: " + ex.GetType().Name + ": " + ex.Message);
             }
+            // v59: 挂 OnlineSyncRoomIdS2C / SyncRoomS2C 探针(只记录, 原回调照常转发)
+            HookSyncProbes();
         }
 
+        /// <summary>
+        /// 每帧回调(Timers.inst.Add(0f, 0, ...))。v64 起这里**只做 Q 键边沿检测** ——
+        /// 键必须每帧采样, 否则会漏按。其余两件事(PumpService 收 HTTP / tooltip 置顶)
+        /// 已移到 OnTick。
+        /// </summary>
         private static void OnFrame(object param)
         {
             try
             {
-                // v25: F9/F10 观战探针已废弃 —— 它会向服务器发观战请求, 实测会让游戏客户端
-                // 走进异常分支(用户报告"卡住/别的错误")。观战改由外部服务用第二个账号做,
-                // mod 只负责把观战码写出来(见 WriteWatchTarget)。
-                // v26: 收观战服务的 HTTP 响应(必须在下面提前 return 之前)
-                PumpService();
-                // v39: Q 键切换"显示队友手牌" —— 默认关闭(零渲染开销), 需要时按一下看。
-                // 只切换本地显示开关, **不发任何网络请求**(与已废弃的 F9 完全不同)。
-                // 本机 Win32 输入后端不可用(走 Unity 反射, 按住期间持续为 true), 必须自己做边沿检测。
-                bool keyQ = false;
+                // ★ 2026-10-27 v65 (二分): 不再用 SDK 反射读键。
+                //   每帧回调里现在只剩"读一次 Q 键"这一个动作, 而它原来是
+                //   InputService.IsKeyDown —— 走 SDK 反射调 Input.GetKey, 每帧 60 次
+                //   MethodInfo.Invoke(有分配, 持续制造 GC)。改为直接调
+                //   UnityEngine.Input.GetKeyDown: 原生调用、不分配, 而且它本身就是
+                //   "按下那一帧"的边沿, 不需要 _keyQHeld 自己判。
+                //   若 GetKeyDown 在本机不可用(不抛异常但恒为 false), 回退到原反射路径。
+                bool down = false;
+                bool nativeOk = false;
                 try
                 {
-                    keyQ = InputService.IsKeyDown(KeyCode.Q);
+                    down = UnityEngine.Input.GetKeyDown(KeyCode.Q);
+                    nativeOk = true;
                 }
                 catch (Exception)
                 {
                 }
-                if (keyQ && !_keyQHeld)
+                // 第一帧就判定走的是哪条路, 只打一次 —— 否则"还跳"时分不清
+                // 是原生路径没生效, 还是根因不在读键。
+                if (nativeOk)
+                {
+                    if (_keyPath != 1)
+                    {
+                        _keyPath = 1;
+                        SdkLog.Info("WatchHand", "Q 键路径 = 原生 UnityEngine.Input.GetKeyDown");
+                    }
+                }
+                else
+                {
+                    if (_keyPath != 2)
+                    {
+                        _keyPath = 2;
+                        SdkLog.Info("WatchHand", "Q 键路径 = InputService 反射 fallback (GetKeyDown 不可用)");
+                    }
+                    bool held = false;
+                    try
+                    {
+                        held = InputService.IsKeyDown(KeyCode.Q);
+                    }
+                    catch (Exception)
+                    {
+                    }
+                    down = held && !_keyQHeld;
+                    _keyQHeld = held;
+                }
+                if (down)
                 {
                     _handsVisible = !_handsVisible;
                     if (!_handsVisible)
@@ -1295,33 +1610,21 @@ namespace WatchHandMod
                         {
                         }
                     }
+                    else
+                    {
+                        // v77: Q 键现在是唯一的开关入口(屏幕正中的按钮已删除)。
+                        //   打开时立即刷新一次, 与原来按钮点击的行为对齐; 顺便让
+                        //   _lastWatchCode 立刻有值, 后面的 2.1 秒轮询才能马上开始
+                        //   (WriteWatchTarget 本身只有每 30 tick 一次)。
+                        try
+                        {
+                            RequestHandsOnce();
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }
                     SdkLog.Info("WatchHand", "KeyQ: 队友手牌显示 = " + _handsVisible);
-                }
-                _keyQHeld = keyQ;
-                if (_tip == null || _tip.isDisposed || !_tip.visible)
-                {
-                    return;
-                }
-                // 只在"当前父容器内"提到最后。
-                // 不能在这里改父容器 —— 否则会和 Update() 里"挂到 HUD 根"的逻辑互相打架
-                // (每帧被搬回 GRoot, 于是永远被 HUD 盖住)。
-                // v37: 关键修复 —— 原来**每帧**在 GRoot(根容器)上 SetChildIndex 重排序子节点,
-                // 实测持续掉帧。降低到每 30 帧(约 30 秒? 不, OnFrame 是每帧)…… 这里用帧计数节流:
-                // 提示框只需要"大致在最上层", 每 60 帧(约 1 秒)置顶一次完全够用。
-                _frameTicks++;
-                if (_frameTicks % 60 != 0)
-                {
-                    return;
-                }
-                GComponent parent = _tip.parent as GComponent;
-                if (parent == null)
-                {
-                    return;
-                }
-                int last = parent.numChildren - 1;
-                if (last > 0 && parent.GetChildIndex(_tip) != last)
-                {
-                    parent.SetChildIndex(_tip, last);
                 }
             }
             catch (Exception)
@@ -1332,9 +1635,102 @@ namespace WatchHandMod
         private static void OnTick()
         {
             _ticks++;
+            // ★ 2026-10-27 v70: 在途请求的清理必须**无条件**执行。
+            //   原来只有在 PollService 里才会调 FinishServiceRequest, 而 PollService 被
+            //   开关门控挡住。于是"请求还在途时把 P 关掉"(或关掉 B 且手牌不显示) 会让
+            //   _svcReq 永远不为 null、那个 UnityWebRequest 对象永远不被 Dispose ——
+            //   日志里就是 poll # 之后再无任何收尾。官方的写法是 SetViewing(false) 里
+            //   无条件 DisposeRequest(), 不看别的开关。这里补上同样的语义。
+            try
+            {
+                if (_svcReq != null)
+                {
+                    // ★ v75: 恢复"完成即收"。
+                    //   v72 把自动轮询挪到 _swBgReq 开关后面时, 顺手把唯一会检查 isDone 的
+                    //   PollService 也一起关掉了, 而 _swBgReq 默认 false。结果 v74 里每个请求
+                    //   都没人检查完成, 一律挂满 PollHardTimeoutTicks(≈9.8 秒) 才被当成
+                    //   "请求超时"丢掉, completed 恒为 false, 响应一次都读不到。
+                    //   实测症状与之一致: 打开手牌后"跳"约 10 秒后自己停 —— 那 10 秒就是这条
+                    //   硬超时。修好后在途窗口应等于真实响应时间。
+                    bool done = false;
+                    bool probeOk = true;
+                    try
+                    {
+                        done = (bool)SvProp(_svcReq, "isDone");
+                    }
+                    catch (Exception)
+                    {
+                        probeOk = false;   // 反射失败不误判为完成, 退回原来的超时/禁用路径
+                    }
+                    bool stale = _svcPollStarted > 0
+                        && (_ticks - _svcPollStarted) > PollHardTimeoutTicks;
+                    bool notAllowed = !(_swPoll && (_handsVisible || _swBgReq));
+                    if (probeOk && done)
+                    {
+                        FinishServiceRequest(true);
+                    }
+                    else if (stale || notAllowed)
+                    {
+                        // v73: 实测 UnityWebRequest.timeout 在本机不生效(请求能挂 20+ 秒
+                        //      仍在途), 所以必须用自己的帧计数做硬超时, 否则这个请求会
+                        //      一直占着 Unity 的 WebRequest 不释放。
+                        SdkLog.Info("WatchHand", (stale ? "请求超时(帧计数), 丢弃" : "已不允许发请求, 丢弃在途请求")
+                            + "(Dispose)");
+                        FinishServiceRequest(false);
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
+            // ★ 2026-10-27 v63: 原先这三件事在每帧的 OnFrame 里(每秒 60 次), 现统一搬到
+            //   这里(0.5 秒一次)。目的: 彻底去掉每帧回调, 二分验证"界面周期性重置"的
+            //   来源。PumpService 晚 0.5 秒收结果、tooltip 晚 0.5 秒置顶, 都无感。
+            try
+            {
+                if (_swPoll)
+                {
+                    PumpService();
+                }
+            }
+            catch (Exception)
+            {
+            }
+            try
+            {
+                if (_tip != null && !_tip.isDisposed && _tip.visible)
+                {
+                    GComponent tipParent = _tip.parent as GComponent;
+                    if (tipParent != null)
+                    {
+                        int tipLast = tipParent.numChildren - 1;
+                        if (tipLast > 0 && tipParent.GetChildIndex(_tip) != tipLast)
+                        {
+                            tipParent.SetChildIndex(_tip, tipLast);
+                        }
+                    }
+                }
+            }
+            catch (Exception)
+            {
+            }
             if (_ticks < 3)
             {
                 return;
+            }
+            // v68: 探针各有开关, 用来逐项定位"跳"的来源。
+            if (_swHook && _ticks % 2 == 0)
+            {
+                HookSyncProbes();
+            }
+            if (_swDiag)
+            {
+                SampleProbeFingerprint();
+            }
+            // v68: 手牌按钮 + 诊断开关的维护。不受"渲染"开关影响, 否则关掉渲染就点不到了。
+            if (_ticks % 6 == 0)
+            {
+                EnsureUiButtons();
             }
             // v36: 从 OnTick 开头开始计时(诊断卡顿)
             int pStart = Environment.TickCount;
@@ -1367,10 +1763,12 @@ namespace WatchHandMod
             // v25: 把当前对局的观战码写出来, 给外部观战服务用(它用第二个账号进观战拿四人手牌)。
             // 取代了 v22~v24 那个"按 F9 发观战请求"的做法 —— 那个会让游戏客户端异常。
             // v35: 观战码变化很慢, 每 30 帧(0.5 秒)写一次足够, 减少文件 IO
-            if (_ticks % 30 == 0)
+            if (_swWrite && _ticks % 30 == 0)
             {
                 try
                 {
+                    // 2026-10-26: 诊断实验 #2 已确认 —— 注释掉它之后界面不再周期刷新,
+                    // 元凶是函数里的 room.info 访问(现已改为 room.watchCode), 故恢复调用。
                     WriteWatchTarget();
                 }
                 catch (Exception ex)
@@ -1379,26 +1777,37 @@ namespace WatchHandMod
                         + ": " + ex.Message);
                 }
             }
-            // v26: 观战服务轮询(只有写了 watch_service.json 才启用; 没配置时零开销)
-            // v35: 每 6 帧(约 0.1 秒)检查一次, 内部仍有 2 秒节流
-            if (_ticks % 6 == 0)
+            // v26: 观战服务轮询
+            // v76 (2026-10-27): 恢复"手牌可见时轮询", 间隔约 2.1 秒(4 tick)。
+            //   ① 必要性(日志实测 05:50~05:52 那次): 只发一次请求时, 服务端还在 join
+            //      就返回 pending(界面显示"服务正在加入观战"), 之后没人重试
+            //      -> 手牌永远出不来(svcDiag: hands=0 age=never busy=0
+            //      err=服务正在加入观战)。
+            //   ② 安全性: 服务端 v1.3 已加空闲退出(IDLE_EXIT_SEC=5s) —— 客户端一停请求,
+            //      5 秒内就 WatchExitRoomC2S 退出观战并清空 wanted, 所以"关掉手牌还跳"
+            //      已经由服务端解决; 客户端可以放心在"手牌可见"期间持续请求。
+            //   间隔必须明显小于 IDLE_EXIT_SEC, 否则会反复"退出-重进"。
+            if (_ticks % 4 == 0)
             {
                 try
                 {
                     RefreshServiceConfig();
-                    if (!string.IsNullOrEmpty(_svcUrl) && !string.IsNullOrEmpty(_lastWatchCode))
+                    if (_swPoll
+                        && (_handsVisible || _swBgReq)
+                        && !string.IsNullOrEmpty(_svcUrl)
+                        && !string.IsNullOrEmpty(_lastWatchCode))
                     {
                         PollService(_lastWatchCode);
                     }
                 }
                 catch (Exception ex)
                 {
-                    SdkLog.Warn("WatchHand", "tick6 RefreshServiceConfig 抛出: " + ex.GetType().Name
+                    SdkLog.Warn("WatchHand", "tick4 RefreshServiceConfig 抛出: " + ex.GetType().Name
                         + ": " + ex.Message);
                 }
             }
             // v21: 把三个手牌数据源打出来对比(只读诊断) —— v35: 每 60 帧(约 1 秒)一次
-            if (_ticks % 60 == 0)
+            if (_swDiag && _ticks % 60 == 0)
             {
                 try
                 {
@@ -1419,7 +1828,7 @@ namespace WatchHandMod
             // 0.1 秒的显示延迟肉眼无感。
             // v36: 计时诊断 —— 连续两版降频都没解决, 不再猜, 直接量每部分耗时(毫秒)。
             int t0 = Environment.TickCount;
-            if (_ticks % 6 == 0)
+            if (_swRender && _ticks % 6 == 0)
             {
                 try
                 {
@@ -1440,9 +1849,9 @@ namespace WatchHandMod
                 LogOnce("tooltip: " + ex.GetType().Name + ": " + ex.Message);
             }
             int tB = Environment.TickCount;
-            if (_ticks % 5 == 0)
+            if (_swDiag && _ticks % 5 == 0)
             {
-                SdkLog.Info("WatchHand", "prof tick=" + _ticks + " hooked=" + (p1 - pStart) + "ms attrLog=" + (p2 - p1) + "ms rest=" + (t0 - p2) + "ms update=" + (tA - t0) + "ms tooltip=" + (tB - tA) + "ms");
+                SdkLog.Info("WatchHand", "prof tick=" + _ticks + " hooked=" + (p1 - pStart) + "ms attrLog=" + (p2 - p1) + "ms rest=" + (t0 - p2) + "ms update=" + (tA - t0) + "ms tooltip=" + (tB - tA) + "ms stripHit=" + _stripHits + " stripRebuild=" + _stripRebuilds);
             }
         }
 
@@ -1460,9 +1869,275 @@ namespace WatchHandMod
         // 手牌卡图
         // =====================================================================
 
+        /// <summary>
+        /// v66: 屏幕上的"手牌"开关按钮, 取代原来的 Q 键。
+        /// 原因: Q 键要求每帧轮询来做边沿检测, 而每帧回调正是本 mod 与官方 HandViewerMod
+        /// 最大的结构差异 —— 官方全程 onClick 事件驱动, 从不注册每帧回调。
+        /// 按钮走 FairyGUI 的 onClick, 零轮询。
+        /// </summary>
+        private static void EnsureToggle(UIBattleInfoPanel panel)
+        {
+            GComponent host = (GComponent)panel;
+            if (_toggle != null && !_toggle.isDisposed && _toggle.parent == host)
+            {
+                if (_toggleText != null && !_toggleText.isDisposed)
+                {
+                    string want = _handsVisible ? "手牌 ▲" : "手牌 ▼";
+                    if (_toggleText.text != want)
+                    {
+                        _toggleText.text = want;
+                    }
+                }
+                return;
+            }
+            if (_toggle != null)
+            {
+                try
+                {
+                    if (_toggle.parent != null)
+                    {
+                        _toggle.parent.RemoveChild(_toggle);
+                    }
+                    _toggle.Dispose();
+                }
+                catch (Exception)
+                {
+                }
+                _toggle = null;
+                _toggleText = null;
+            }
+            try
+            {
+                GComponent box = new GComponent();
+                box.opaque = true;
+                box.touchable = true;
+                box.SetSize(ToggleW, ToggleH);
+                GGraph bg = new GGraph();
+                bg.SetSize(ToggleW, ToggleH);
+                bg.DrawRect(ToggleW, ToggleH, 1, Color.white, new Color(0.06f, 0.09f, 0.16f, 0.88f));
+                bg.touchable = false;
+                box.AddChild(bg);
+                GTextField txt = new GTextField();
+                txt.text = _handsVisible ? "手牌 ▲" : "手牌 ▼";
+                txt.singleLine = true;
+                // 必须取现有 textFormat 改再赋回(结构体); new TextFormat() 会清空 font 导致不渲染
+                TextFormat fmt = txt.textFormat;
+                fmt.size = 13;
+                fmt.color = Color.white;
+                txt.textFormat = fmt;
+                txt.touchable = false;
+                box.AddChild(txt);
+                box.onClick.Add(delegate(EventContext ctx)
+                {
+                    ctx.StopPropagation();
+                    _handsVisible = !_handsVisible;
+                    if (!_handsVisible)
+                    {
+                        try
+                        {
+                            HideAll();
+                        }
+                        catch (Exception)
+                        {
+                        }
+                    }
+                    else
+                    {
+                        // v72: 每次打开手牌只发一次请求, 不再定时轮询。
+                        //      "发请求"这个动作本身会让游戏画面周期性重置, 官方靠
+                        //      "只在展开时发一次 + 5 秒收回"避开, 这里采用同样策略。
+                        //      想刷新就关掉再打开。
+                        RequestHandsOnce();
+                    }
+                    SdkLog.Info("WatchHand", "手牌按钮: 显示 = " + _handsVisible);
+                });
+                host.AddChild(box);
+                // 定位到屏幕右上角: 先用 GRoot 坐标算, 再转成面板局部坐标,
+                // 这样不依赖面板自身尺寸/原点。
+                // v68: 挪到屏幕正中(用户指定)。
+                Vector2 gp = GRoot.inst.LocalToGlobal(
+                    new Vector2(GRoot.inst.width * 0.5f - ToggleW * 0.5f,
+                                GRoot.inst.height * 0.5f - 83f));
+                Vector2 lp = host.GlobalToLocal(gp);
+                box.SetXY(lp.x, lp.y);
+                _toggle = box;
+                _toggleText = txt;
+            }
+            catch (Exception ex)
+            {
+                SdkLog.Warn("WatchHand", "EnsureToggle: " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        /// <summary>v68: 右上角一排诊断开关, 点一下切换对应行为。</summary>
+        private static void EnsureSwitches(UIBattleInfoPanel panel)
+        {
+            GComponent host = (GComponent)panel;
+            if (_swBox != null && !_swBox.isDisposed && _swBox.parent == host)
+            {
+                for (int i = 0; i < 6; i++)
+                {
+                    if (_swTexts[i] != null && !_swTexts[i].isDisposed)
+                    {
+                        string want = SwNames[i] + (SwGet(i) ? " 开" : " 关");
+                        if (_swTexts[i].text != want)
+                        {
+                            _swTexts[i].text = want;
+                        }
+                    }
+                }
+                return;
+            }
+            if (_swBox != null)
+            {
+                try
+                {
+                    if (_swBox.parent != null)
+                    {
+                        _swBox.parent.RemoveChild(_swBox);
+                    }
+                    _swBox.Dispose();
+                }
+                catch (Exception)
+                {
+                }
+                _swBox = null;
+            }
+            try
+            {
+                GComponent box = new GComponent();
+                box.opaque = false;
+                // v68: 父容器本身也要可触摸 —— 设成 false 时子按钮的点击收不到,
+                //      表现就是"开关点不动/关不掉"。
+                box.touchable = true;
+                box.SetSize(ToggleW, ToggleH * 6f + 20f);
+                for (int i = 0; i < 6; i++)
+                {
+                    int idx = i;
+                    GComponent btn = new GComponent();
+                    btn.opaque = true;
+                    btn.touchable = true;
+                    btn.SetSize(ToggleW, ToggleH);
+                    GGraph bg = new GGraph();
+                    bg.SetSize(ToggleW, ToggleH);
+                    bg.DrawRect(ToggleW, ToggleH, 1, Color.white, new Color(0.06f, 0.09f, 0.16f, 0.88f));
+                    bg.touchable = false;
+                    btn.AddChild(bg);
+                    GTextField t = new GTextField();
+                    t.text = SwNames[idx] + (SwGet(idx) ? " 开" : " 关");
+                    t.singleLine = true;
+                    TextFormat fmt = t.textFormat;
+                    fmt.size = 12;
+                    fmt.color = Color.white;
+                    t.textFormat = fmt;
+                    t.touchable = false;
+                    btn.AddChild(t);
+                    btn.SetXY(0f, (float)idx * (ToggleH + 4f));
+                    btn.onClick.Add(delegate(EventContext ctx)
+                    {
+                        ctx.StopPropagation();
+                        SwToggle(idx);
+                    });
+                    box.AddChild(btn);
+                    _swTexts[idx] = t;
+                }
+                host.AddChild(box);
+                Vector2 gp = GRoot.inst.LocalToGlobal(
+                    new Vector2(GRoot.inst.width * 0.5f - ToggleW * 0.5f,
+                                GRoot.inst.height * 0.5f - 83f + ToggleH + 6f));
+                Vector2 lp = host.GlobalToLocal(gp);
+                box.SetXY(lp.x, lp.y);
+                _swBox = box;
+            }
+            catch (Exception ex)
+            {
+                SdkLog.Warn("WatchHand", "EnsureSwitches: " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
+        /// <summary>v68: 维护"手牌"按钮与诊断开关。由 OnTick 每 6 tick 无条件调用,
+        /// 不依赖 _swRender —— 否则关掉渲染后按钮就不再更新了。</summary>
+        private static void EnsureUiButtons()
+        {
+            try
+            {
+                // v78 (2026-10-27): 用户要求把屏幕上的鼠标按钮组全部去掉 ——
+                //   "手牌 ▲/▼"按钮(v77 已删) 和 6 个诊断开关(H/W/P/R/D/B) 都不再创建。
+                //   手牌开关改由 Q 键独占(OnFrame 里的 UnityEngine.Input.GetKeyDown(KeyCode.Q));
+                //   诊断开关对应的行为仍按字段默认值生效, 只是界面上不能再点。
+                //   这里只负责清理旧版可能残留的对象, 不创建任何 UI。
+                RemoveIfAlive(ref _toggle);
+                RemoveIfAlive(ref _swBox);
+                _toggleText = null;
+                for (int i = 0; i < _swTexts.Length; i++)
+                {
+                    _swTexts[i] = null;
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
+        /// <summary>v78: 把一个 FairyGUI 组件从父节点摘掉并销毁, 然后把引用置空。</summary>
+        private static void RemoveIfAlive(ref GComponent go)
+        {
+            try
+            {
+                if (go == null)
+                {
+                    return;
+                }
+                if (!go.isDisposed && go.parent != null)
+                {
+                    go.parent.RemoveChild(go);
+                }
+                if (!go.isDisposed)
+                {
+                    go.Dispose();
+                }
+            }
+            catch (Exception)
+            {
+            }
+            go = null;
+        }
+
+        /// <summary>
+        /// v72: 手动刷新一次手牌 —— 只在"打开手牌"这一刻调用, 不做任何定时轮询。
+        /// 原因: 实测"发起 HTTP 请求"这个动作本身会让游戏画面周期性重置(选中框消失/
+        /// 视角回自己), 与请求成功还是失败无关; 官方 HandViewerMod 靠"只在展开时发一次"
+        /// 把这个影响压到最低。这里照同样的策略: 想刷新就关掉手牌再打开。
+        /// </summary>
+        private static void RequestHandsOnce()
+        {
+            try
+            {
+                WriteWatchTarget();      // 先确保 _lastWatchCode 是最新的
+                if (string.IsNullOrEmpty(_svcUrl) || string.IsNullOrEmpty(_lastWatchCode))
+                {
+                    SdkLog.Info("WatchHand", "手动刷新: 还没有观战码, 跳过");
+                    return;
+                }
+                if (_svcReq != null)
+                {
+                    FinishServiceRequest(false);   // 丢掉旧的(可能还挂着的)请求
+                }
+                _svcLastPoll = 0;                  // 绕开 4 tick 节流
+                SdkLog.Info("WatchHand", "手动刷新: 发一次请求 code=" + _lastWatchCode);
+                StartServiceRequest(_lastWatchCode);
+            }
+            catch (Exception ex)
+            {
+                SdkLog.Warn("WatchHand", "RequestHandsOnce: " + ex.GetType().Name + ": " + ex.Message);
+            }
+        }
+
         private static void Update()
         {
-            // v39: 默认不画队友手牌(渲染开销为 0); 按 Q 打开后才走后面的绘制。
+            // v68: 按钮/开关维护已移到 OnTick 的 EnsureUiButtons()(每 6 tick 无条件执行),
+            //      这样即使关掉"渲染"开关, 开关按钮本身仍可点、文字仍会刷新。
+            // v39: 默认不画队友手牌(渲染开销为 0); 按钮点开后才走后面的绘制。
             if (!_handsVisible)
             {
                 HideAll();
@@ -1541,7 +2216,7 @@ namespace WatchHandMod
                 // v20: 队友手牌取"服务器实时快照"优先(GameEvents.HandChanged),
                 // 没有才回退游戏容器(实测对队友只有开局快照)
                 IReadOnlyList<HandCardData> cards = CardsOf(rp, cc);
-                GComponent strip = EnsureStrip(i, owner);
+                GComponent strip = EnsureStrip(i, owner, panel);
                 if (strip == null)
                 {
                     continue;
@@ -1556,8 +2231,7 @@ namespace WatchHandMod
                     }
                     else
                     {
-                        // v1.0: 没有明确错误, 但有"过期"的时间戳 -> 说明服务停止更新了
-                        // (帧计数判定: age>10 帧 ≈ 5 秒)
+                        // v44: 没有明确错误, 但有"过期"的时间戳 -> 说明服务停止更新了(帧计数判定)
                         long ageTicks2 = _ticks - _svcHandsAtTicks;
                         if (_svcHandsAtTicks > 0 && ageTicks2 > SvcStaleTicks)
                         {
@@ -1634,29 +2308,112 @@ namespace WatchHandMod
                 if (s != null && !s.isDisposed)
                 {
                     s.visible = false;
+                    // ★ 2026-10-27 v62: 彻底销毁, 不是只摘掉。
+                    //   之前只 RemoveChild 不 Dispose: 对象连同里面 24 张卡一直泄漏,
+                    //   日志里 "strip 重建 #N why=父容器不是 GRoot: 现 parent='<null>'" 就是它,
+                    //   而且下一轮 EnsureStrip 又会 new 一个, 反复累积。
+                    try
+                    {
+                        if (s.parent != null)
+                        {
+                            s.parent.RemoveChild(s);
+                        }
+                        s.Dispose();
+                    }
+                    catch (Exception)
+                    {
+                    }
                 }
+                Strips[i] = null;
                 LastSig[i] = null;
             }
             Spots.Clear();
         }
 
-        private static GComponent EnsureStrip(int index, GComponent owner)
+        private static GComponent EnsureStrip(int index, GComponent owner, UIBattleInfoPanel panel)
         {
             GComponent s = Strips[index];
-            if (s != null && !s.isDisposed && s.parent == owner)
+            if (s != null && !s.isDisposed && s.parent == (GComponent)panel)
             {
+                _stripHits++;
                 s.visible = true;
+                PositionStrip(s, owner, panel);   // 每 tick 跟随按钮位置
                 return s;
+            }
+            // ---- 诊断(v46): 走到这里 = 需要重建 ----
+            _stripRebuilds++;
+            if (_stripRebuildLogs < 8 || _stripRebuilds % 40 == 0)
+            {
+                _stripRebuildLogs++;
+                string why;
+                if (s == null)
+                {
+                    why = "首次创建";
+                }
+                else if (s.isDisposed)
+                {
+                    why = "已被释放(isDisposed)";
+                }
+                else
+                {
+                    string pn = "<null>";
+                    string pt = "?";
+                    try
+                    {
+                        GObject par = s.parent;
+                        if (par != null)
+                        {
+                            pn = par.name ?? "";
+                            pt = par.GetType().Name;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                    }
+                    why = "父容器不是 HUD 面板: 现 parent='" + pn + "'(" + pt + ")";
+                }
+                SdkLog.Info("WatchHand", "strip 重建 #" + _stripRebuilds + " idx=" + index
+                    + " hits=" + _stripHits + " why=" + why);
             }
             s = new GComponent();
             s.touchable = false;
             s.SetSize(CardH * 3f, CardH + LabelH);
-            // 贴在"整个玩家条目"右侧之外, 不遮挡原有的名字/星币/血量
-            s.x = owner.width + 4f;
-            s.y = (owner.height - (CardH + LabelH)) * 0.5f;
-            owner.AddChild(s);
+            // ★ 2026-10-27 v62: 改挂游戏自己的 HUD 面板(UIBattleInfoPanel), 与官方 HandViewerMod 一致。
+            //   前两个挂载点都太"全局", 实测都会把界面带回默认状态(选中框消失 / 视角回自己):
+            //     com_Player_N —— 破坏 Button 的子节点结构(3 -> 7), 游戏每次刷新按钮都要处理外来节点;
+            //     GRoot        —— 改根容器的子节点与全局排序(sortingOrder=9000), 问题依旧。
+            //   面板是普通 HUD 层, 官方就挂这里且不设 sortingOrder。
+            if (panel != null)
+            {
+                ((GComponent)panel).AddChild(s);
+            }
+            else
+            {
+                GRoot.inst.AddChild(s);
+            }
             Strips[index] = s;
+            PositionStrip(s, owner, panel);
             return s;
+        }
+
+        /// <summary>
+        /// 把 strip 摆到玩家按钮右侧。v62 起 strip 挂在 UIBattleInfoPanel 上,
+        /// 所以要把按钮的全局坐标转成该面板的局部坐标(面板为 null 时退回 GRoot)。
+        /// 每次 EnsureStrip 都会调用一次, 按钮位置变化时能跟上。
+        /// </summary>
+        private static void PositionStrip(GComponent s, GComponent owner, UIBattleInfoPanel panel)
+        {
+            try
+            {
+                GComponent baseC = panel != null ? (GComponent)panel : GRoot.inst;
+                Vector2 gp = owner.LocalToGlobal(Vector2.zero);
+                Vector2 lp = baseC.GlobalToLocal(gp);
+                s.SetXY(lp.x + owner.width + 4f,
+                        lp.y + (owner.height - (CardH + LabelH)) * 0.5f);
+            }
+            catch (Exception)
+            {
+            }
         }
 
         /// <summary>
@@ -1776,6 +2533,10 @@ namespace WatchHandMod
                 }
                 UICom_Card card = UICom_Card.CreateInstance();
                 holder.AddChild(card);
+                // ★ 2026-10-26: 立刻关掉触摸。下面 "card 尺寸 <= 0" 分支和 catch 分支
+                // 都会提前 return Fallback, 跳过原来放在 1814 的 card.touchable = false,
+                // 会留下一个可触摸的 UICom_Card 留在 strip 里吞点击。
+                card.touchable = false;
 
                 // 卡名: 客户端 STRCard 表里存的是 CARD-0XX 占位符, 优先用内嵌的社区卡表
                 string cardName = CardTable.Name(data.CardId);
@@ -2306,6 +3067,10 @@ namespace WatchHandMod
                 _tip.AddChild(_tipText);
                 _tip.touchable = false;
                 _tipText.touchable = false;
+                // ★ 2026-10-26 修复"点 A 落到 B": GGraph 的 touchable 默认是 true,
+                // _tip.touchable=false 不会传递给子元素, 于是这块 340×h 的背景
+                // (sortingOrder=10000, 压在全部 HUD 之上) 一直吞掉它范围内的点击。
+                _tipBg.touchable = false;
                 // ★ 关键修正: 给提示框一个极高的 sortingOrder, 压过游戏所有 HUD 容器。
                 // 只靠 childIndex 是不够的 —— 游戏容器自己的排序会赢(实测三种挂载位置全被压住)。
                 try
@@ -2403,7 +3168,10 @@ namespace WatchHandMod
             // 每 tick 把它挪到根容器的最后一个子级(= 最上层), 避免被游戏 HUD 盖住
             try
             {
-                if (_tip.parent != GRoot.inst)
+                // ★ 2026-10-26: 原来只要 _tip.parent 不是 GRoot.inst 就重挂一遍,
+                // 每 tick 都可能对全局根容器做 AddChild, 会触发显示列表重建。
+                // 只在确实没有父节点时才挂一次。
+                if (_tip.parent == null)
                 {
                     GRoot.inst.AddChild(_tip);
                 }
@@ -2457,13 +3225,10 @@ namespace WatchHandMod
                 return;
             }
             _tip.visible = false;
-            try
-            {
-                GRoot.inst.HidePopup(_tip);
-            }
-            catch (Exception)
-            {
-            }
+            // v45: 这里原本还调了 GRoot.inst.HidePopup(_tip) —— 用错了 API。
+            // _tip 是用 AddChild 加到 GRoot 的普通子节点, 从没进过 FairyGUI 的 popup 栈;
+            // HidePopup 会去动 GRoot 的弹窗栈 / modal 状态, 对不在栈里的对象调用结果不确定,
+            // 可能扰动全局点击判定(症状: 点 A 落到 B)。上一行 visible=false 已足够。
         }
 
         // =====================================================================

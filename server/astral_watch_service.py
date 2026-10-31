@@ -51,7 +51,16 @@ DEFAULT_PORT = 8800
 CMD_WATCH_JOIN = 5191
 CMD_WATCH_REFRESH = 5193
 CMD_WATCH_EXIT = 5195           # 退出观战 —— 服务器一个账号只允许一个观战会话
-JOIN_RETRY_SEC = 10.0           # v42: 加入失败后的重试间隔(秒)
+# v1.4 (2026-10-27): 10 -> 3 秒。原因: 观战小号发 refresh 一律被服务器拒(11001),
+# 手牌数据实际上只靠"重新 join"更新, 所以 join 周期就是数据新鲜度的上限。
+# 10 秒太慢(手牌明显落后), 先压到 3 秒; 若被服务器限流再回调。
+JOIN_RETRY_SEC = 3.0            # v42: 加入失败后的重试间隔(秒)
+# v1.3 (2026-10-27): 客户端(手牌)关掉后不再发 /hands 请求, 但原来 wanted 永不清空 ->
+# worker 会永远以 JOIN_RETRY_SEC 为周期 join/refresh, 而每次 join 都会让房内玩家的
+# 客户端重置一次视角并清空选目标(用户实测: 发过请求就跳, 从来没发过就不跳)。
+# 修法: 超过这个秒数没有新请求, 服务端主动 WatchExitRoomC2S 并清空 wanted。
+# 取值要大于 mod 的轮询间隔(拟 2 秒), 又要足够小让"关掉手牌"尽快生效。
+IDLE_EXIT_SEC = 5.0
 RECONNECT_COOLDOWN = 30.0       # v1.0: 断线重连的冷却(秒), 避免频繁重新登录被限流
 CMD_GET_SHOW_PLAYER = 5153      # 查玩家展示信息(含最近对局的 replayId)
 REPLAY_HOST = "https://sereplaycn.feimogames.com/prod/%s"   # 国服回放服务器
@@ -123,6 +132,8 @@ class WatchService:
         self._last_beat = 0.0
         self._beat_fails = 0          # v1.0: 心跳连续失败次数
         self._last_reconnect = 0.0    # v1.0: 上次重连时刻
+        # v1.3: 最后一次 /hands 请求的时刻 —— 超过 IDLE_EXIT_SEC 就退出观战
+        self._last_hands_at = time.time()
         self.login_data = ""      # ConnectS2C.data(可能含游戏服列表)
 
     # ── 登录 ──
@@ -260,6 +271,16 @@ class WatchService:
                 self.sessions.pop(c, None)
                 self.wanted.discard(c)
 
+    def exit_all_sessions(self):
+        """v1.3: 空闲退出 —— 退掉所有观战会话并清空 wanted。
+
+        与 exit_other_sessions 的区别: 那个是"换到另一个房间"时把旧会话退掉,
+        这个是"没人再看了"时清全部, 也包括 sessions 已空但 wanted 还有残留的情况。
+        """
+        self.exit_other_sessions("")
+        with self.lock:
+            self.wanted.clear()
+
     def refresh(self, sess: dict):
         try:
             self.client.heartbeat()      # 查询前补一次心跳
@@ -270,7 +291,10 @@ class WatchService:
         m.room_server_id = sess["room_server_id"]
         rsp = self.client.send(CMD_WATCH_REFRESH, m, wait=10.0)
         if rsp.get("err"):
-            return "refresh-rejected err=%s" % rsp.get("err")
+            # v1.4: 把请求参数一并打出来 —— 之前只记错误码, 分不清是
+            # "room_id/room_server_id 传错" 还是 "观战者本来就不该调 refresh"。
+            return "refresh-rejected err=%s (req room=%s server=%s)" % (
+                rsp.get("err"), m.room_id, m.room_server_id)
         s2 = self.proto.new_msg("protocol.WatchRefreshRoomStateS2C")
         s2.ParseFromString(rsp["body"])
         room = getattr(s2, "room", None)
@@ -451,6 +475,16 @@ class WatchService:
                             self.reconnect("心跳连续失败")
                 with self.lock:
                     codes = set(self.wanted)
+                    idle_sec = time.time() - self._last_hands_at
+                # v1.3: 客户端已经不再请求 -> 主动退出观战。
+                # 这是"手牌关掉之后还在跳"的根因修复: 原来 wanted 只加不清,
+                # worker 会永远以 JOIN_RETRY_SEC 为周期 join/refresh, 每次 join
+                # 都让房内玩家客户端重置一次视角。
+                if codes and idle_sec > IDLE_EXIT_SEC:
+                    log("空闲 %.1fs 无 /hands 请求, 退出观战并清空 wanted (%s)"
+                        % (idle_sec, ",".join(sorted(codes))))
+                    self.exit_all_sessions()
+                    codes = set()
                 # 新请求的观战码：先加入
                 for code in list(codes):
                     with self.lock:
@@ -481,8 +515,9 @@ class WatchService:
                         if sess:
                             with self.lock:
                                 self.sessions[code] = sess
-                            log("已加入观战 code=%s room=%s players=%s"
-                                % (code, sess["room_id"], len(sess["players"])))
+                            log("已加入观战 code=%s room=%s server=%s players=%s"
+                                % (code, sess["room_id"], sess["room_server_id"],
+                                   len(sess["players"])))
                         else:
                             log("加入观战失败 code=%s: %s (将在 %ds 后重试)"
                                 % (code, err, JOIN_RETRY_SEC))
@@ -499,6 +534,15 @@ class WatchService:
                         err = self.refresh(sess)
                         if err:
                             sess["err"] = err
+                            # v1.1: 房间不存在/会话失效 -> 清 room_id, 让下一轮重新 join。
+                            # 否则 room_id 始终非 0, 永远走不到重新 join 那条路, 只会每 2 秒
+                            # 重试同一个注定失败的 refresh(实测卡住 70 秒以上不更新)。
+                            if ("11001" in err or "11079" in err
+                                    or "11081" in err or "11002" in err):
+                                sess["room_id"] = 0
+                                sess["updated"] = now
+                                log("刷新被拒(%s), 将重新加入 code=%s"
+                                    % (err, code))
                     except Exception as exc:
                         sess["err"] = "refresh-exception %s" % exc
                 if now - last_health > 30:
@@ -513,6 +557,8 @@ class WatchService:
     # ── 给 HTTP 用 ──
     def hands(self, code: str) -> dict:
         with self.lock:
+            # v1.3: 有请求就"续命", 空闲退出计时器归零
+            self._last_hands_at = time.time()
             # v41: 只保留"最新请求的房间"。原来 wanted 只加不清, worker 会同时观战
             # 多个房间, 而服务器一个账号只允许一个会话 -> 换局后新房间必被 err=11079 拒。
             if code not in self.wanted:
@@ -523,7 +569,12 @@ class WatchService:
                 return {"ok": False, "pending": True, "code": code,
                         "hint": "service is joining the room; retry in ~2s"}
             return {
-                "ok": not sess.get("err") and bool(sess.get("players")),
+                # v1.2 (2026-10-26): 有 players 就算 ok。
+                # 原来要求 err 为空, 但 refresh(WatchRefreshRoomStateC2S) 长期被
+                # 11001 拒, 而 join 仍每 10 秒成功拿到完整四人数据 —— 旧判定把
+                # 整份响应丢掉, 症状是 mod 一直显示"手牌加载失败"。
+                # refresh 的失败原因仍放在 err 里返回, 供排查。
+                "ok": bool(sess.get("players")),
                 "code": code,
                 "room_id": sess.get("room_id", 0),
                 "room_server_id": sess.get("room_server_id", 0),

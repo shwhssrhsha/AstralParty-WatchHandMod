@@ -9,34 +9,51 @@
     <EnableDefaultCompileItems>true</EnableDefaultCompileItems>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <NoWarn>CS0618;CS0612</NoWarn>
-    <!-- 发布版: 不生成调试符号, 避免把本机源码路径嵌进 dll -->
+    <!-- 2026-10-27 发布版: 不生成/嵌入调试符号。
+         否则 MSBuild 会把源文件的本机绝对路径(如 F:\Documents\...\ModEntry.cs)写进 dll,
+         分发给别人就等于暴露自己的目录结构。自用版不加这一项, 保留调试符号方便排查。 -->
     <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- 2026-10-27: _ref 下是 HandViewerMod 的反编译参考代码(只用来对照实现),
+         不属于本工程源码。EnableDefaultCompileItems=true 会把 **/*.cs 全部编译进来,
+         导致 22 个语法错误(反编译的 <>c 内部类名等)。这里显式排除。 -->
+    <Compile Remove="_ref\**\*.cs" />
+  </ItemGroup>
+
+  <ItemGroup>
     <Reference Include="CesiumLoader.SDK">
-      <HintPath>..\..\tools\cesium-sdk\CesiumLoader.SDK.dll</HintPath>
+      <HintPath>..\..\..\tools\cesium-sdk\CesiumLoader.SDK.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <!-- AstralParty.Runtime.dll 内含 FairyGUI + GameLogic + UI + party.model/protocol 全部热更类型 -->
     <Reference Include="AstralParty.Runtime">
-      <HintPath>..\..\extracted_dlls\AstralParty.Runtime.dll</HintPath>
+      <HintPath>..\..\..\extracted_dlls\AstralParty.Runtime.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.CoreModule">
-      <HintPath>..\..\extracted_dlls\UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>..\..\..\extracted_dlls\UnityEngine.CoreModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine.IMGUIModule">
-      <HintPath>..\..\il2cpp_dump2\DummyDll\UnityEngine.IMGUIModule.dll</HintPath>
+      <HintPath>..\..\..\il2cpp_dump2\DummyDll\UnityEngine.IMGUIModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <!-- v65: UnityEngine.Input 在 InputLegacyModule 里(不在 CoreModule)。
+         只是为了能直接调 Input.GetKeyDown, 避开 SDK 反射读键;
+         Private=false, 运行时由游戏本体提供。 -->
+    <Reference Include="UnityEngine.InputLegacyModule">
+      <HintPath>..\..\..\il2cpp_dump2\DummyDll\UnityEngine.InputLegacyModule.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Google.Protobuf.Runtime">
-      <HintPath>..\..\extracted_dlls\Google.Protobuf.Runtime.dll</HintPath>
+      <HintPath>..\..\..\extracted_dlls\Google.Protobuf.Runtime.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UniTask">
-      <HintPath>..\..\extracted_dlls\UniTask.dll</HintPath>
+      <HintPath>..\..\..\extracted_dlls\UniTask.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <!-- UnityWebRequestModule(DummyDll) 的重载解析需要框架版 System.Uri; 改用 WebClient, 不再需要 -->
