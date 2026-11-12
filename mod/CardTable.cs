@@ -83,6 +83,8 @@ namespace WatchHandMod
             // 2026-10-15 补: 官方 10/15 更新公告「新卡牌: 疾行菇、仙品杨桃、芳香蜜桃、招财树」
             //   编号连号 + 卡图为"树+星币"(cardart/exported/UT_HandCard_21029.png) 三重印证
             { 21029, "招财树" },
+            { 21030, "开花仙人球" },
+            { 21031, "电流蒲公英" },
         };
 
         public static readonly Dictionary<int, string> Descs = new Dictionary<int, string>
